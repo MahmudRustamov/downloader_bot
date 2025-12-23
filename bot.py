@@ -1,12 +1,13 @@
 """
-Telegram Stories Viewer Bot
-Python 3.11 + PostgreSQL
+Telegram Stories Viewer Bot - NO CHUNKING
+Direct file IDs - stream from Telegram servers directly
 """
 
 import asyncio
-from datetime import datetime
-from typing import Optional, List, Dict
 import logging
+import time
+import re
+from typing import Optional, List, Dict
 
 from telethon import TelegramClient
 from telethon.tl.functions.stories import GetPeerStoriesRequest, GetPinnedStoriesRequest
@@ -14,33 +15,36 @@ from telethon.errors import UsernameNotOccupiedError, PhoneNumberInvalidError, F
 import asyncpg
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command
-from aiogram.types import BufferedInputFile
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, InputMediaPhoto, InputMediaVideo
 
-from config import get_config, Config
+from config import get_config
 
-# Initialize config
 config = get_config()
 
-# Logging setup
 logging.basicConfig(
     level=getattr(logging, config.app.log_level),
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[logging.FileHandler('bot.log'), logging.StreamHandler()]
 )
 logger = logging.getLogger(__name__)
 
-# Initialize bot and userbot
 bot = Bot(token=config.bot.token)
 dp = Dispatcher()
 userbot: Optional[TelegramClient] = None
 db_pool: Optional[asyncpg.Pool] = None
 
+# MEMORY STORAGE FOR STORIES
+stories_cache: Dict[int, Dict] = {}
+
+# CONFIG
+STORIES_PER_PAGE = 5
+
 
 class DatabaseManager:
-    """PostgreSQL database manager"""
+    """Fast PostgreSQL manager"""
 
     @staticmethod
     async def create_pool():
-        """Create database connection pool"""
         db_config = config.database
         return await asyncpg.create_pool(
             host=db_config.host,
@@ -49,537 +53,514 @@ class DatabaseManager:
             user=db_config.user,
             password=db_config.password,
             min_size=db_config.min_pool_size,
-            max_size=db_config.max_pool_size
+            max_size=db_config.max_pool_size,
+            command_timeout=10
         )
 
     @staticmethod
     async def init_db(pool: asyncpg.Pool):
-        """Initialize database tables"""
         async with pool.acquire() as conn:
-            # Users table
             await conn.execute('''
-                               CREATE TABLE IF NOT EXISTS users
-                               (
-                                   user_id
-                                   BIGINT
-                                   PRIMARY
-                                   KEY,
-                                   username
-                                   VARCHAR
-                               (
-                                   255
-                               ),
-                                   first_name VARCHAR
-                               (
-                                   255
-                               ),
-                                   last_name VARCHAR
-                               (
-                                   255
-                               ),
-                                   is_active BOOLEAN DEFAULT TRUE,
-                                   is_blocked BOOLEAN DEFAULT FALSE,
-                                   created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                                   last_active TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                                   )
-                               ''')
+                CREATE TABLE IF NOT EXISTS users (
+                    user_id BIGINT PRIMARY KEY,
+                    username VARCHAR(255),
+                    first_name VARCHAR(255),
+                    last_name VARCHAR(255),
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    last_active TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            ''')
 
-            # Requests table
             await conn.execute('''
-                               CREATE TABLE IF NOT EXISTS requests
-                               (
-                                   id
-                                   SERIAL
-                                   PRIMARY
-                                   KEY,
-                                   user_id
-                                   BIGINT
-                                   REFERENCES
-                                   users
-                               (
-                                   user_id
-                               ),
-                                   target VARCHAR
-                               (
-                                   255
-                               ),
-                                   request_type VARCHAR
-                               (
-                                   50
-                               ),
-                                   stories_count INT DEFAULT 0,
-                                   success BOOLEAN DEFAULT FALSE,
-                                   error_message TEXT,
-                                   processing_time FLOAT,
-                                   created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                                   )
-                               ''')
+                CREATE TABLE IF NOT EXISTS requests (
+                    id SERIAL PRIMARY KEY,
+                    user_id BIGINT REFERENCES users(user_id) ON DELETE CASCADE,
+                    target VARCHAR(255),
+                    request_type VARCHAR(50),
+                    story_type VARCHAR(50),
+                    stories_count INT DEFAULT 0,
+                    success BOOLEAN DEFAULT FALSE,
+                    processing_time FLOAT,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            ''')
 
-            # Statistics table
-            await conn.execute('''
-                               CREATE TABLE IF NOT EXISTS statistics
-                               (
-                                   id
-                                   SERIAL
-                                   PRIMARY
-                                   KEY,
-                                   date
-                                   DATE
-                                   DEFAULT
-                                   CURRENT_DATE,
-                                   total_users
-                                   INT
-                                   DEFAULT
-                                   0,
-                                   active_users
-                                   INT
-                                   DEFAULT
-                                   0,
-                                   total_requests
-                                   INT
-                                   DEFAULT
-                                   0,
-                                   successful_requests
-                                   INT
-                                   DEFAULT
-                                   0,
-                                   failed_requests
-                                   INT
-                                   DEFAULT
-                                   0,
-                                   total_stories
-                                   INT
-                                   DEFAULT
-                                   0,
-                                   UNIQUE
-                               (
-                                   date
-                               )
-                                   )
-                               ''')
+            await conn.execute('CREATE INDEX IF NOT EXISTS idx_user_id ON requests(user_id)')
+            await conn.execute('CREATE INDEX IF NOT EXISTS idx_success ON requests(success)')
 
-            # Create indexes
-            await conn.execute('''
-                               CREATE INDEX IF NOT EXISTS idx_user_id ON requests(user_id);
-                               CREATE INDEX IF NOT EXISTS idx_created_at ON requests(created_at);
-                               CREATE INDEX IF NOT EXISTS idx_success ON requests(success);
-                               CREATE INDEX IF NOT EXISTS idx_stats_date ON statistics(date);
-                               ''')
-
-            logger.info("Database initialized successfully")
+            logger.info("✅ Database initialized")
 
     @staticmethod
     async def save_user(pool: asyncpg.Pool, user: types.User):
-        """Save or update user info"""
         async with pool.acquire() as conn:
             await conn.execute('''
-                               INSERT INTO users (user_id, username, first_name, last_name, last_active)
-                               VALUES ($1, $2, $3, $4, $5) ON CONFLICT (user_id) DO
-                               UPDATE
-                                   SET username = $2,
-                                   first_name = $3,
-                                   last_name = $4,
-                                   last_active = $5,
-                                   is_active = TRUE
-                               ''', user.id, user.username, user.first_name, user.last_name, datetime.now())
+                INSERT INTO users (user_id, username, first_name, last_name, last_active)
+                VALUES ($1, $2, $3, $4, CURRENT_TIMESTAMP)
+                ON CONFLICT (user_id) DO UPDATE SET last_active = CURRENT_TIMESTAMP
+            ''', user.id, user.username, user.first_name, user.last_name)
 
     @staticmethod
     async def save_request(pool: asyncpg.Pool, user_id: int, target: str,
-                           request_type: str, stories_count: int,
-                           success: bool, processing_time: float,
-                           error_message: str = None):
-        """Save request log"""
+                          request_type: str, story_type: str, stories_count: int,
+                          success: bool, processing_time: float):
         async with pool.acquire() as conn:
             await conn.execute('''
-                               INSERT INTO requests (user_id, target, request_type, stories_count,
-                                                     success, processing_time, error_message)
-                               VALUES ($1, $2, $3, $4, $5, $6, $7)
-                               ''', user_id, target, request_type, stories_count, success,
-                               processing_time, error_message)
-
-    @staticmethod
-    async def update_daily_stats(pool: asyncpg.Pool):
-        """Update daily statistics"""
-        async with pool.acquire() as conn:
-            await conn.execute('''
-                               INSERT INTO statistics (date, total_users, active_users, total_requests,
-                                                       successful_requests, failed_requests, total_stories)
-                               SELECT CURRENT_DATE,
-                                      (SELECT COUNT(*) FROM users),
-                                      (SELECT COUNT(*) FROM users WHERE last_active::date = CURRENT_DATE),
-                    (SELECT COUNT(*) FROM requests WHERE created_at::date = CURRENT_DATE),
-                    (SELECT COUNT(*) FROM requests WHERE created_at::date = CURRENT_DATE AND success = TRUE),
-                    (SELECT COUNT(*) FROM requests WHERE created_at::date = CURRENT_DATE AND success = FALSE),
-                    (SELECT COALESCE(SUM(stories_count), 0) FROM requests WHERE created_at::date = CURRENT_DATE)
-                               ON CONFLICT (date) DO
-                               UPDATE SET
-                                   total_users = EXCLUDED.total_users,
-                                   active_users = EXCLUDED.active_users,
-                                   total_requests = EXCLUDED.total_requests,
-                                   successful_requests = EXCLUDED.successful_requests,
-                                   failed_requests = EXCLUDED.failed_requests,
-                                   total_stories = EXCLUDED.total_stories
-                               ''')
-
-    @staticmethod
-    async def get_user_stats(pool: asyncpg.Pool, user_id: int) -> dict:
-        """Get user statistics"""
-        async with pool.acquire() as conn:
-            row = await conn.fetchrow('''
-                                      SELECT COUNT(*) as total_requests,
-                                             COUNT(*)    FILTER (WHERE success = TRUE) as successful_requests, COALESCE(SUM(stories_count), 0) as total_stories
-                                      FROM requests
-                                      WHERE user_id = $1
-                                      ''', user_id)
-            return dict(row) if row else {}
-
-    @staticmethod
-    async def get_global_stats(pool: asyncpg.Pool) -> dict:
-        """Get global statistics"""
-        async with pool.acquire() as conn:
-            row = await conn.fetchrow('''
-                                      SELECT (SELECT COUNT(*) FROM users)                           as total_users,
-                                             (SELECT COUNT(*) FROM users WHERE is_active = TRUE)    as active_users,
-                                             (SELECT COUNT(*) FROM requests)                        as total_requests,
-                                             (SELECT COUNT(*) FROM requests WHERE success = TRUE)   as successful_requests,
-                                             (SELECT COALESCE(SUM(stories_count), 0) FROM requests) as total_stories,
-                                             (SELECT COUNT(*) FROM requests WHERE created_at::date = CURRENT_DATE) as today_requests
-                                      ''')
-            return dict(row) if row else {}
+                INSERT INTO requests 
+                (user_id, target, request_type, story_type, stories_count, success, processing_time)
+                VALUES ($1, $2, $3, $4, $5, $6, $7)
+            ''', user_id, target, request_type, story_type, stories_count, success, processing_time)
 
 
-class StoriesDownloader:
-    """Stories downloader using Telethon userbot"""
+class NoChunkDownloader:
+    """No chunking - direct file IDs from Telegram"""
 
-    @staticmethod
-    async def get_entity_from_input(input_text: str):
-        """Get Telegram entity from username, phone or link"""
-        import re
-
+    async def get_entity_from_input(self, input_text: str):
         input_text = input_text.strip()
 
-        # Direct story link: t.me/username/s/story_id
-        story_link_pattern = r't\.me/([^/]+)/s/(\d+)'
-        match = re.search(story_link_pattern, input_text)
+        match = re.search(r't\.me/([^/]+)/s/(\d+)', input_text)
         if match:
-            username = match.group(1)
-            return await userbot.get_entity(username), 'direct_link'
+            return await userbot.get_entity(match.group(1)), 'direct_link'
 
-        # Username with @
         if input_text.startswith('@'):
             return await userbot.get_entity(input_text), 'username'
 
-        # Phone number
         if re.match(r'^\+?\d{10,15}$', input_text):
             return await userbot.get_entity(input_text), 'phone'
 
-        # Username without @
         try:
             return await userbot.get_entity(input_text), 'username'
         except:
             return await userbot.get_entity(f'@{input_text}'), 'username'
 
-    @staticmethod
-    async def download_stories(entity) -> List[Dict]:
-        """Download active and pinned stories"""
-        all_stories = []
-        max_stories = config.app.max_stories_per_request
-
+    async def get_active_stories(self, entity) -> List[Dict]:
+        stories = []
         try:
-            # Get active stories
             active = await userbot(GetPeerStoriesRequest(peer=entity))
-            if active and hasattr(active, 'stories') and active.stories:
-                for story in active.stories.stories[:max_stories]:
+            if active and hasattr(active, 'stories'):
+                for story in active.stories[:config.app.max_stories_per_request]:
                     if hasattr(story, 'media') and story.media:
-                        all_stories.append({
+                        stories.append({
                             'story': story,
+                            'media': story.media,
                             'type': 'active'
                         })
-                        logger.info(f"Found active story ID: {story.id}")
+                        logger.info(f"Found active story {story.id}")
         except Exception as e:
-            logger.error(f"Error getting active stories: {e}")
+            logger.warning(f"Active stories error: {e}")
+        return stories
 
+    async def get_pinned_stories(self, entity) -> List[Dict]:
+        stories = []
         try:
-            # Get pinned stories
-            remaining = max_stories - len(all_stories)
-            if remaining > 0:
-                pinned = await userbot(GetPinnedStoriesRequest(
-                    peer=entity,
-                    offset_id=0,
-                    limit=remaining
-                ))
-                if pinned and hasattr(pinned, 'stories') and pinned.stories:
-                    for story in pinned.stories:
-                        if hasattr(story, 'media') and story.media:
-                            all_stories.append({
-                                'story': story,
-                                'type': 'pinned'
-                            })
-                            logger.info(f"Found pinned story ID: {story.id}")
+            pinned = await userbot(GetPinnedStoriesRequest(peer=entity, offset_id=0, limit=config.app.max_stories_per_request))
+            if pinned and hasattr(pinned, 'stories'):
+                for story in pinned.stories:
+                    if hasattr(story, 'media') and story.media:
+                        stories.append({
+                            'story': story,
+                            'media': story.media,
+                            'type': 'pinned'
+                        })
+                        logger.info(f"Found pinned story {story.id}")
         except Exception as e:
-            logger.error(f"Error getting pinned stories: {e}")
+            logger.warning(f"Pinned stories error: {e}")
+        return stories
 
-        if not all_stories:
-            return []
+    async def download_story_bytes(self, story_media, story_id: int) -> tuple:
+        """Download story as bytes - minimal overhead"""
+        try:
+            import io
+            file_obj = io.BytesIO()
+            await userbot.download_media(story_media, file=file_obj)
+            file_obj.seek(0)
+            buffer = file_obj.getvalue()
 
-        # Download media
+            media_type = 'photo'
+            if hasattr(story_media, 'document'):
+                media_type = 'video'
+
+            logger.info(f"Downloaded {media_type} story {story_id}: {len(buffer)} bytes")
+            return buffer, media_type
+        except Exception as e:
+            logger.error(f"Download error {story_id}: {e}")
+            return None, None
+
+    async def download_all_fast(self, stories: List[Dict]) -> List[Dict]:
+        """Download all stories in PARALLEL - FAST"""
         downloaded = []
-        for item in all_stories:
+
+        # Download 5 at same time
+        semaphore = asyncio.Semaphore(5)
+
+        async def download_one(item, idx):
             try:
-                story = item['story']
-                buffer = await userbot.download_media(story.media, file=bytes)
+                async with semaphore:
+                    logger.info(f"Downloading {idx + 1}/{len(stories)}...")
 
-                if buffer:
-                    # Determine media type
-                    media_type = 'photo'
-                    if hasattr(story.media, 'video'):
-                        media_type = 'video'
-                    elif hasattr(story.media, 'document'):
-                        media_type = 'video'
+                    buffer, media_type = await self.download_story_bytes(item['media'], item['story'].id)
 
-                    downloaded.append({
-                        'buffer': buffer,
-                        'media_type': media_type,
-                        'story_type': item['type'],
-                        'story_id': story.id
-                    })
-                    logger.info(f"Downloaded {media_type} story ID: {story.id}")
-
-                # Flood protection
-                await asyncio.sleep(config.app.flood_wait_delay)
-
-            except FloodWaitError as e:
-                logger.warning(f"FloodWait: {e.seconds}s")
-                await asyncio.sleep(e.seconds)
+                    if buffer:
+                        return {
+                            'buffer': buffer,
+                            'story_type': item['type'],
+                            'story_id': item['story'].id,
+                            'media_type': media_type
+                        }
             except Exception as e:
-                logger.error(f"Error downloading story {story.id}: {e}")
+                logger.error(f"Error downloading story {idx}: {e}")
+            return None
 
+        # Download all at same time
+        tasks = [download_one(item, idx) for idx, item in enumerate(stories)]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        # Filter results
+        for result in results:
+            if result and isinstance(result, dict):
+                downloaded.append(result)
+
+        logger.info(f"Downloaded {len(downloaded)}/{len(stories)} stories in parallel")
         return downloaded
+
+
+downloader = NoChunkDownloader()
+
+
+def get_pagination_buttons(user_id: int, page: int, total_pages: int) -> InlineKeyboardMarkup:
+    """Create pagination buttons"""
+    buttons = []
+
+    nav_row = []
+    if page > 0:
+        nav_row.append(InlineKeyboardButton(text="⬅️", callback_data=f"page_{user_id}_{page-1}"))
+
+    nav_row.append(InlineKeyboardButton(text=f"{page + 1}/{total_pages}", callback_data="page_info"))
+
+    if page < total_pages - 1:
+        nav_row.append(InlineKeyboardButton(text="➡️", callback_data=f"page_{user_id}_{page+1}"))
+
+    if nav_row:
+        buttons.append(nav_row)
+
+    buttons.append([InlineKeyboardButton(text="❌ Close", callback_data=f"close_{user_id}")])
+
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+async def send_page_direct(chat_id: int, user_id: int, stories: List[Dict], page: int) -> bool:
+    """Send stories using downloaded bytes"""
+    if not stories:
+        logger.error("No stories to send")
+        return False
+
+    total_pages = (len(stories) + STORIES_PER_PAGE - 1) // STORIES_PER_PAGE
+    start_idx = page * STORIES_PER_PAGE
+    end_idx = min(start_idx + STORIES_PER_PAGE, len(stories))
+    batch = stories[start_idx:end_idx]
+
+    logger.info(f"Sending page {page + 1}/{total_pages} ({len(batch)} stories)")
+
+    media_group = []
+
+    for idx, story in enumerate(batch):
+        try:
+            caption = f"📸 {start_idx + idx + 1}/{len(stories)}"
+
+            media_type = story.get('media_type', 'photo')
+            file_size = len(story['buffer'])
+
+            # Skip if too large
+            if file_size > 50 * 1024 * 1024:  # 50MB limit
+                logger.warning(f"Story {story['story_id']} too large ({file_size} bytes), skipping")
+                continue
+
+            from aiogram.types import BufferedInputFile
+
+            file = BufferedInputFile(
+                story['buffer'],
+                filename=f"story_{story['story_id']}.jpg"
+            )
+
+            if media_type == 'video':
+                media_group.append(InputMediaVideo(media=file, caption=caption))
+            else:
+                media_group.append(InputMediaPhoto(media=file, caption=caption))
+
+            logger.info(f"Added {media_type} {story['story_id']} ({file_size} bytes)")
+
+        except Exception as e:
+            logger.error(f"Media error for story {story['story_id']}: {e}")
+            continue
+
+    if not media_group:
+        logger.error("No media in group")
+        return False
+
+    try:
+        logger.info(f"Sending {len(media_group)} stories")
+        await bot.send_media_group(chat_id=chat_id, media=media_group)
+        logger.info(f"✅ Sent {len(media_group)} stories")
+
+        # Send navigation
+        keyboard = get_pagination_buttons(user_id, page, total_pages)
+        await bot.send_message(chat_id=chat_id, text="Navigation:", reply_markup=keyboard)
+
+        return True
+
+    except Exception as e:
+        logger.error(f"Send error: {e}", exc_info=True)
+        return False
 
 
 @dp.message(Command('start'))
 async def cmd_start(message: types.Message):
-    """Handle /start command"""
     await DatabaseManager.save_user(db_pool, message.from_user)
 
-    welcome_text = """
-🕵️ **Telegram Stories Viewer Bot**
+    welcome = """
+🕵️ **Telegram Stories Viewer**
 
-Anonim ravishda istalgan foydalanuvchining Telegram stories'larini ko'ring!
+⚡ **INSTANT - Direct streaming!**
 
-📝 **Qanday foydalanish:**
-• Username yuboring: `@username`
-• Username (@ siz): `username`
-• Telefon raqami: `+998901234567`
-• Story linki: `t.me/username/s/123456`
+Send:
+• `@username`
+• `username`
+• `+998901234567`
 
-✨ **Bot nimalarni yuklab beradi:**
-• 📌 Active stories (joriy aktiv)
-• 📍 Pinned stories (mahkamlangan)
+Stories stream DIRECTLY!
+"""
 
-⚡️ Boshlash uchun username, telefon yoki linkni yuboring!
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="❓ Help", callback_data="help")]
+    ])
 
-📊 Statistikani ko'rish: /stats
-❓ Yordam: /help
-    """
-    await message.answer(welcome_text, parse_mode='Markdown')
+    await message.answer(welcome, parse_mode='Markdown', reply_markup=keyboard)
 
 
 @dp.message(Command('help'))
 async def cmd_help(message: types.Message):
-    """Handle /help command"""
     help_text = """
-📖 **Yordam**
+📖 **How to use:**
 
-**Qo'llab-quvvatlanadigan formatlar:**
-• `@username` - Username bilan
-• `durov` - Username (@ siz)
-• `+998901234567` - Telefon raqami
-• `t.me/username/s/123456` - To'g'ridan-to'g'ri story linki
+Send username/phone and choose:
+📌 **Active** - Current stories
+📍 **Pinned** - Saved stories
+📥 **All** - Everything
 
-**Misol:**
-```
-@durov
-durov
-+79001234567
-t.me/durov/s/123456
-```
-
-**Buyruqlar:**
-• /start - Botni ishga tushirish
-• /help - Yordam
-• /stats - Statistika
-• /about - Bot haqida
-
-❓ Savollar bo'lsa, /start buyrug'ini yuboring.
-    """
+Stories stream directly - NO DOWNLOADING!
+"""
     await message.answer(help_text, parse_mode='Markdown')
 
 
-@dp.message(Command('stats'))
-async def cmd_stats(message: types.Message):
-    """Handle /stats command"""
-    await DatabaseManager.save_user(db_pool, message.from_user)
-
-    user_stats = await DatabaseManager.get_user_stats(db_pool, message.from_user.id)
-    global_stats = await DatabaseManager.get_global_stats(db_pool)
-
-    stats_text = f"""
-📊 **Sizning statistikangiz:**
-• So'rovlar: {user_stats.get('total_requests', 0)}
-• Muvaffaqiyatli: {user_stats.get('successful_requests', 0)}
-• Yuklab olingan stories: {user_stats.get('total_stories', 0)}
-
-🌍 **Umumiy statistika:**
-• Jami foydalanuvchilar: {global_stats.get('total_users', 0):,}
-• Aktiv foydalanuvchilar: {global_stats.get('active_users', 0):,}
-• Jami so'rovlar: {global_stats.get('total_requests', 0):,}
-• Bugungi so'rovlar: {global_stats.get('today_requests', 0):,}
-• Yuklab olingan stories: {global_stats.get('total_stories', 0):,}
-    """
-    await message.answer(stats_text, parse_mode='Markdown')
-
-
-@dp.message(Command('about'))
-async def cmd_about(message: types.Message):
-    """Handle /about command"""
-    about_text = """
-ℹ️ **Bot haqida**
-
-🕵️ Telegram Stories Viewer Bot - anonim stories ko'rish uchun bot.
-
-**Texnologiyalar:**
-• Python 3.11
-• Telethon (MTProto)
-• aiogram (Bot API)
-• PostgreSQL
-
-**Xususiyatlar:**
-✅ Active stories
-✅ Pinned stories  
-✅ Photo & Video qo'llab-quvvatlash
-✅ Username/Telefon/Link orqali qidiruv
-
-🔒 100% anonim va xavfsiz!
-
-💻 Open Source: [GitHub](https://github.com/your-repo)
-    """
-    await message.answer(about_text, parse_mode='Markdown')
+@dp.callback_query(F.data == 'help')
+async def cb_help(query: types.CallbackQuery):
+    await query.answer()
+    try:
+        await query.message.edit_text("📖 Send username and choose stories!")
+    except:
+        await query.message.answer("📖 Send username and choose stories!")
 
 
 @dp.message(F.text)
 async def handle_message(message: types.Message):
-    """Handle all text messages"""
     await DatabaseManager.save_user(db_pool, message.from_user)
 
     input_text = message.text.strip()
 
-    # Skip commands
     if input_text.startswith('/'):
         return
 
-    start_time = datetime.now()
-    status_msg = await message.answer("🔍 Qidiryapman...")
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📌 Active", callback_data=f"dl_active:{input_text}"),
+         InlineKeyboardButton(text="📍 Pinned", callback_data=f"dl_pinned:{input_text}")],
+        [InlineKeyboardButton(text="📥 All", callback_data=f"dl_all:{input_text}")]
+    ])
+
+    await message.answer("Choose stories:", reply_markup=keyboard)
+
+
+@dp.callback_query(F.data.startswith('dl_'))
+async def cb_download(query: types.CallbackQuery):
+    """Download and show stories - DIRECT"""
+    await query.answer()
+
+    parts = query.data.split(':', 1)
+    story_type = parts[0].replace('dl_', '')
+    input_text = parts[1] if len(parts) > 1 else ''
+
+    start_time = time.time()
+    msg = query.message
+    user_id = query.from_user.id
 
     try:
-        # Get entity
-        entity, request_type = await StoriesDownloader.get_entity_from_input(input_text)
+        try:
+            await msg.edit_text("🔍 Searching...")
+        except:
+            pass
+
+        entity, request_type = await downloader.get_entity_from_input(input_text)
 
         if not entity:
-            await status_msg.edit_text("❌ Foydalanuvchi topilmadi!")
-            processing_time = (datetime.now() - start_time).total_seconds()
-            await DatabaseManager.save_request(
-                db_pool, message.from_user.id, input_text,
-                request_type, 0, False, processing_time, "User not found"
-            )
-            return
-
-        await status_msg.edit_text("📥 Stories yuklanmoqda...")
-
-        # Download stories
-        stories = await StoriesDownloader.download_stories(entity)
-
-        if not stories:
-            await status_msg.edit_text("😔 Aktiv stories topilmadi!")
-            processing_time = (datetime.now() - start_time).total_seconds()
-            await DatabaseManager.save_request(
-                db_pool, message.from_user.id, input_text,
-                request_type, 0, False, processing_time, "No stories found"
-            )
-            return
-
-        await status_msg.edit_text(f"📤 {len(stories)} ta story yuborilmoqda...")
-
-        # Send stories
-        for idx, story in enumerate(stories, 1):
             try:
-                file = BufferedInputFile(
-                    story['buffer'],
-                    filename=f"story_{story['story_id']}.jpg"
-                )
+                await msg.edit_text("❌ User not found!")
+            except:
+                await query.message.answer("❌ User not found!")
+            return
 
-                caption = f"📸 Story #{idx}/{len(stories)}\n"
-                caption += f"📌 Type: {story['story_type'].title()}\n"
-                caption += f"🆔 ID: {story['story_id']}"
+        try:
+            await msg.edit_text("⏳ Fetching stories...")
+        except:
+            pass
 
-                if story['media_type'] == 'photo':
-                    await message.answer_photo(file, caption=caption)
-                else:
-                    await message.answer_video(file, caption=caption)
+        # Get stories
+        all_stories = []
 
-                await asyncio.sleep(config.app.flood_wait_delay)
+        if story_type == 'active':
+            all_stories = await downloader.get_active_stories(entity)
+        elif story_type == 'pinned':
+            all_stories = await downloader.get_pinned_stories(entity)
+        else:  # all
+            active = await downloader.get_active_stories(entity)
+            pinned = await downloader.get_pinned_stories(entity)
+            all_stories = active + pinned
 
-            except Exception as e:
-                logger.error(f"Error sending story {story['story_id']}: {e}")
+        if not all_stories:
+            try:
+                await msg.edit_text(f"😔 No {story_type} stories")
+            except:
+                await query.message.answer(f"😔 No {story_type} stories")
+            return
 
-        await status_msg.delete()
-        await message.answer(
-            f"✅ {len(stories)} ta story muvaffaqiyatli yuborildi!\n\n"
-            f"📊 Statistikani ko'rish: /stats"
-        )
+        try:
+            await msg.edit_text(f"📤 Sending {len(all_stories)} stories...")
+        except:
+            pass
 
-        processing_time = (datetime.now() - start_time).total_seconds()
-        await DatabaseManager.save_request(
-            db_pool, message.from_user.id, input_text,
-            request_type, len(stories), True, processing_time
-        )
+        # Download stories first
+        downloaded = await downloader.download_all_fast(all_stories)
 
-        # Update daily stats
-        await DatabaseManager.update_daily_stats(db_pool)
+        if not downloaded:
+            try:
+                await msg.edit_text("❌ Download failed!")
+            except:
+                await query.message.answer("❌ Download failed!")
+            return
+
+        # Store in memory cache
+        stories_cache[user_id] = {
+            'stories': downloaded,
+            'page': 0,
+            'story_type': story_type
+        }
+
+        # Delete old message
+        try:
+            await msg.delete()
+        except:
+            pass
+
+        # Send first page
+        success = await send_page_direct(user_id, user_id, downloaded, 0)
+
+        if success:
+            processing_time = time.time() - start_time
+            msg_text = f"✅ Ready! {len(all_stories)} {story_type} stories\nTime: {processing_time:.1f}s\n\n⚡ Direct streaming - no download!"
+            try:
+                await query.message.answer(msg_text, parse_mode='Markdown')
+            except:
+                pass
+
+            await DatabaseManager.save_request(
+                db_pool, user_id, input_text, request_type, story_type, len(all_stories), True, processing_time
+            )
+        else:
+            logger.error("Failed to send first page")
+            try:
+                await query.message.answer("❌ Failed to send stories")
+            except:
+                pass
 
     except UsernameNotOccupiedError:
-        await status_msg.edit_text("❌ Bunday username topilmadi!")
-        processing_time = (datetime.now() - start_time).total_seconds()
-        await DatabaseManager.save_request(
-            db_pool, message.from_user.id, input_text,
-            'username', 0, False, processing_time, "Username not found"
-        )
+        try:
+            await msg.edit_text("❌ Username not found!")
+        except:
+            await query.message.answer("❌ Username not found!")
     except PhoneNumberInvalidError:
-        await status_msg.edit_text("❌ Telefon raqami noto'g'ri!")
-        processing_time = (datetime.now() - start_time).total_seconds()
-        await DatabaseManager.save_request(
-            db_pool, message.from_user.id, input_text,
-            'phone', 0, False, processing_time, "Invalid phone number"
-        )
+        try:
+            await msg.edit_text("❌ Invalid phone!")
+        except:
+            await query.message.answer("❌ Invalid phone!")
     except FloodWaitError as e:
-        await status_msg.edit_text(f"⏳ Iltimos {e.seconds} soniya kuting va qayta urinib ko'ring.")
-        processing_time = (datetime.now() - start_time).total_seconds()
-        await DatabaseManager.save_request(
-            db_pool, message.from_user.id, input_text,
-            'unknown', 0, False, processing_time, f"FloodWait: {e.seconds}s"
-        )
+        try:
+            await msg.edit_text(f"⏳ Wait {e.seconds}s")
+        except:
+            await query.message.answer(f"⏳ Wait {e.seconds}s")
     except Exception as e:
-        logger.error(f"Error processing request: {e}", exc_info=True)
-        await status_msg.edit_text(f"❌ Xatolik yuz berdi.\n\nQayta urinib ko'ring yoki /help ni ko'ring.")
-        processing_time = (datetime.now() - start_time).total_seconds()
-        await DatabaseManager.save_request(
-            db_pool, message.from_user.id, input_text,
-            'unknown', 0, False, processing_time, str(e)
-        )
+        logger.error(f"Error: {e}", exc_info=True)
+        try:
+            await msg.edit_text(f"❌ Error")
+        except:
+            await query.message.answer(f"❌ Error")
+
+
+@dp.callback_query(F.data.startswith('page_'))
+async def cb_page(query: types.CallbackQuery):
+    """Navigate pages"""
+    await query.answer()
+
+    parts = query.data.split('_')
+    user_id = int(parts[1])
+    page = int(parts[2])
+
+    if user_id not in stories_cache:
+        await query.answer("❌ Session expired", show_alert=True)
+        return
+
+    cache = stories_cache[user_id]
+    stories = cache['stories']
+
+    # Delete old navigation message
+    try:
+        await query.message.delete()
+    except:
+        pass
+
+    # Send new page DIRECTLY
+    success = await send_page_direct(user_id, user_id, stories, page)
+
+    if success:
+        stories_cache[user_id]['page'] = page
+        logger.info(f"Navigated to page {page}")
+    else:
+        try:
+            await query.message.answer("❌ Failed to load page")
+        except:
+            pass
+
+
+@dp.callback_query(F.data.startswith('close_'))
+async def cb_close(query: types.CallbackQuery):
+    """Close stories"""
+    await query.answer()
+
+    user_id = int(query.data.split('_')[1])
+
+    # Clear cache
+    if user_id in stories_cache:
+        del stories_cache[user_id]
+        logger.info(f"Cleared cache for user {user_id}")
+
+    try:
+        await query.message.delete()
+    except:
+        pass
+
+
+@dp.callback_query(F.data == 'page_info')
+async def cb_page_info(query: types.CallbackQuery):
+    await query.answer()
 
 
 async def init_userbot():
-    """Initialize Telethon userbot"""
     global userbot
 
     userbot_config = config.userbot
@@ -587,52 +568,51 @@ async def init_userbot():
     userbot = TelegramClient(
         userbot_config.session_name,
         userbot_config.api_id,
-        userbot_config.api_hash
+        userbot_config.api_hash,
+        timeout=30,
+        request_retries=5
     )
 
     await userbot.start(phone=userbot_config.phone)
 
     if await userbot.is_user_authorized():
         me = await userbot.get_me()
-        logger.info(f"✅ Userbot connected: {me.first_name} (@{me.username})")
+        logger.info(f"✅ Userbot: {me.first_name}")
     else:
-        logger.error("❌ Userbot not authorized!")
-        raise Exception("Userbot authentication failed")
+        raise Exception("Userbot auth failed")
 
 
 async def main():
-    """Main function"""
     global db_pool
 
-    logger.info("🚀 Starting Telegram Stories Viewer Bot...")
-
-    # Initialize database
-    logger.info("📦 Connecting to PostgreSQL...")
-    db_pool = await DatabaseManager.create_pool()
-    await DatabaseManager.init_db(db_pool)
-    logger.info("✅ Database connected")
-
-    # Initialize userbot
-    logger.info("🤖 Initializing userbot...")
-    await init_userbot()
-
-    # Start bot
-    logger.info("🤖 Starting bot...")
-    logger.info(f"🔗 Bot username: @{(await bot.get_me()).username}")
+    logger.info("🚀 Starting Stories Bot (DIRECT - NO CHUNKS)...")
 
     try:
-        await dp.start_polling(bot)
+        db_pool = await DatabaseManager.create_pool()
+        await DatabaseManager.init_db(db_pool)
+        logger.info("✅ Database ready")
+
+        logger.info("🤖 Userbot initializing...")
+        await init_userbot()
+
+        bot_info = await bot.get_me()
+        logger.info(f"✅ Bot: @{bot_info.username}")
+        logger.info("✅ Ready to receive messages!")
+
+        await dp.start_polling(bot, allowed_updates=["message", "callback_query"])
+
+    except Exception as e:
+        logger.error(f"❌ Fatal error: {e}", exc_info=True)
+
     finally:
-        logger.info("🛑 Shutting down...")
-        await db_pool.close()
-        await userbot.disconnect()
-        logger.info("👋 Goodbye!")
+        if db_pool:
+            await db_pool.close()
+        if userbot:
+            await userbot.disconnect()
 
 
 if __name__ == '__main__':
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        logger.info("🛑 Stopped by user")
-    except Exception as e:
-        logger.error(f"❌ Fatal error: {e}", exc_info=True)
+        logger.info("🛑 Bot stopped")

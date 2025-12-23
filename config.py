@@ -15,22 +15,18 @@ load_dotenv()
 class BotConfig:
     """Bot configuration"""
     token: str
-    admin_ids: list[int]
+    admin_ids: list
 
     @classmethod
     def from_env(cls):
         token = os.getenv('BOT_TOKEN')
         if not token:
-            raise ValueError("BOT_TOKEN is not set in .env file")
+            raise ValueError("BOT_TOKEN is required in .env")
 
-        # Admin IDs (vergul bilan ajratilgan)
         admin_ids_str = os.getenv('ADMIN_IDS', '')
-        admin_ids = [int(id.strip()) for id in admin_ids_str.split(',') if id.strip()]
+        admin_ids = [int(id.strip()) for id in admin_ids_str.split(',') if id.strip()] if admin_ids_str else []
 
-        return cls(
-            token=token,
-            admin_ids=admin_ids
-        )
+        return cls(token=token, admin_ids=admin_ids)
 
 
 @dataclass
@@ -47,8 +43,8 @@ class UserbotConfig:
         api_hash = os.getenv('USERBOT_API_HASH')
         phone = os.getenv('USERBOT_PHONE')
 
-        if not api_id or not api_hash or not phone:
-            raise ValueError("USERBOT_API_ID, USERBOT_API_HASH, and USERBOT_PHONE must be set")
+        if not all([api_id, api_hash, phone]):
+            raise ValueError("USERBOT_API_ID, USERBOT_API_HASH, USERBOT_PHONE required")
 
         return cls(
             api_id=int(api_id),
@@ -73,18 +69,13 @@ class DatabaseConfig:
     def from_env(cls):
         return cls(
             host=os.getenv('DB_HOST', 'localhost'),
-            port=int(os.getenv('DB_PORT', '5432')),
+            port=int(os.getenv('DB_PORT', 5432)),
             name=os.getenv('DB_NAME', 'stories_bot'),
             user=os.getenv('DB_USER', 'postgres'),
             password=os.getenv('DB_PASS', ''),
-            min_pool_size=int(os.getenv('DB_MIN_POOL_SIZE', '5')),
-            max_pool_size=int(os.getenv('DB_MAX_POOL_SIZE', '20'))
+            min_pool_size=int(os.getenv('DB_MIN_POOL_SIZE', 5)),
+            max_pool_size=int(os.getenv('DB_MAX_POOL_SIZE', 20))
         )
-
-    @property
-    def dsn(self) -> str:
-        """Get database DSN"""
-        return f"postgresql://{self.user}:{self.password}@{self.host}:{self.port}/{self.name}"
 
 
 @dataclass
@@ -99,17 +90,17 @@ class AppConfig:
     @classmethod
     def from_env(cls):
         return cls(
-            debug=os.getenv('DEBUG', 'False').lower() == 'true',
+            debug=os.getenv('DEBUG', 'false').lower() == 'true',
             log_level=os.getenv('LOG_LEVEL', 'INFO'),
-            max_stories_per_request=int(os.getenv('MAX_STORIES_PER_REQUEST', '100')),
-            request_timeout=int(os.getenv('REQUEST_TIMEOUT', '60')),
-            flood_wait_delay=float(os.getenv('FLOOD_WAIT_DELAY', '0.5'))
+            max_stories_per_request=int(os.getenv('MAX_STORIES_PER_REQUEST', 100)),
+            request_timeout=int(os.getenv('REQUEST_TIMEOUT', 60)),
+            flood_wait_delay=float(os.getenv('FLOOD_WAIT_DELAY', 0.5))
         )
 
 
 @dataclass
 class Config:
-    """Main configuration container"""
+    """Main configuration"""
     bot: BotConfig
     userbot: UserbotConfig
     database: DatabaseConfig
@@ -125,56 +116,14 @@ class Config:
             app=AppConfig.from_env()
         )
 
-    def validate(self):
-        """Validate configuration"""
-        errors = []
 
-        if not self.bot.token:
-            errors.append("Bot token is empty")
-
-        if self.userbot.api_id <= 0:
-            errors.append("Invalid API ID")
-
-        if len(self.userbot.api_hash) < 32:
-            errors.append("Invalid API Hash")
-
-        if not self.userbot.phone.startswith('+'):
-            errors.append("Phone number must start with +")
-
-        if not self.database.password:
-            errors.append("Database password is empty")
-
-        if errors:
-            raise ValueError("Configuration errors:\n" + "\n".join(f"- {e}" for e in errors))
-
-        return True
-
-
-# Singleton instance
+# Singleton
 _config: Optional[Config] = None
 
 
 def get_config() -> Config:
-    """Get configuration singleton"""
+    """Get configuration"""
     global _config
     if _config is None:
         _config = Config.load()
-        _config.validate()
     return _config
-
-
-# Convenience functions
-def get_bot_config() -> BotConfig:
-    return get_config().bot
-
-
-def get_userbot_config() -> UserbotConfig:
-    return get_config().userbot
-
-
-def get_db_config() -> DatabaseConfig:
-    return get_config().database
-
-
-def get_app_config() -> AppConfig:
-    return get_config().app
